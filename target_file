@@ -1,0 +1,164 @@
+"""
+target_extractor.py - Target Speaker Extraction using ESPnet TD-SpeakerBeam (v2.1)
+=================================================================================
+Extracts the enrolled caller's voice from a mixture containing TV, traffic,
+other speakers, and overlapping speech.
+"""
+import os
+import logging
+import threading
+import numpy as np
+
+logger = logging.getLogger("speaker_lock_sdk.target_extractor")
+
+TARGET_EXTRACTION_ENABLED = os.getenv("TARGET_EXTRACTION", "true").lower() == "true"
+TSE_MODEL_TAG = os.getenv(
+    "TSE_MODEL_TAG",
+    "espnet/Wangyou_Zhang_wsj0_2mix_train_enh_tse_td_speakerbeam_raw",
+)
+TSE_WINDOW_MS     = float(os.getenv("TSE_WINDOW_MS", "1500"))
+TSE_MIN_WINDOW_MS = float(os.getenv("TSE_MIN_WINDOW_MS", "1500"))
+TSE_NATIVE_SR     = 16000
+
+if not TARGET_EXTRACTION_ENABLED:
+    logger.warning("⚠️ TARGET_EXTRACTION is OFF — caller isolation DISABLED.")
+
+_MODEL = None
+_MODEL_LOADED = False
+_MODEL_FAILED = False
+_LOAD_LOCK = threading.Lock()
+_FIRST_CALL_LOGGED = False
+
+
+def _load_model():
+    global _MODEL, _MODEL_LOADED, _MODEL_FAILED
+    if _MODEL_LOADED or _MODEL_FAILED:
+        return _MODEL
+    with _LOAD_LOCK:
+        if _MODEL_LOADED or _MODEL_FAILED:
+            return _MODEL
+        try:
+            logger.info(f"🧠 Loading ESPnet TD-SpeakerBeam ({TSE_MODEL_TAG})...")
+            import torch
+            from espnet2.bin.enh_tse_inference import SeparateSpeech
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _MODEL = SeparateSpeech.from_pretrained(
+                model_tag=TSE_MODEL_TAG,
+                segment_size=2.4,
+                hop_size=0.8,
+                normalize_segment_scale=False,
+                show_progressbar=False,
+                ref_channel=None,
+                normalize_output_wav=True,
+                device=device,
+            )
+            _MODEL_LOADED = True
+            logger.info(f"✅ TD-SpeakerBeam loaded on {device.upper()}")
+        except Exception as e:
+            _MODEL_FAILED = True
+            logger.error(f"❌ Failed to load TD-SpeakerBeam: {e}.")
+        return _MODEL
+
+
+class TargetExtractor:
+    def __init__(self, sample_rate: int = 8000):
+        self._sample_rate = sample_rate
+
+    def _ensure_model(self):
+        return _load_model()
+
+    def available(self) -> bool:
+        return TARGET_EXTRACTION_ENABLED and self._ensure_model() is not None
+
+    def _resample(self, pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+        if src_rate == dst_rate or len(pcm) == 0:
+            return pcm
+        n_out = int(len(pcm) * dst_rate / src_rate)
+        if n_out <= 0:
+            return pcm
+        idx = np.linspace(0, len(pcm) - 1, n_out)
+        return np.interp(idx, np.arange(len(pcm)), pcm).astype(np.int16)
+
+    def extract(self, pcm_int16: np.ndarray, enrollment_audio: np.ndarray) -> np.ndarray:
+        global _FIRST_CALL_LOGGED
+        model = self._ensure_model()
+        if model is None or len(pcm_int16) == 0:
+            return pcm_int16
+
+        import torch
+
+        mix_work = (
+            self._resample(pcm_int16, self._sample_rate, TSE_NATIVE_SR)
+            if self._sample_rate != TSE_NATIVE_SR else pcm_int16
+        )
+        enroll_work = (
+            self._resample(enrollment_audio, self._sample_rate, TSE_NATIVE_SR)
+            if self._sample_rate != TSE_NATIVE_SR else enrollment_audio
+        )
+
+        min_mix_s = int(TSE_MIN_WINDOW_MS * TSE_NATIVE_SR / 1000)
+        if len(mix_work) < min_mix_s:
+            mix_work = np.pad(mix_work, (0, min_mix_s - len(mix_work)))
+        if len(enroll_work) < TSE_NATIVE_SR:
+            enroll_work = np.pad(enroll_work, (0, TSE_NATIVE_SR - len(enroll_work)))
+
+        mix_f = mix_work.astype(np.float32) / 32768.0
+        enroll_f = enroll_work.astype(np.float32) / 32768.0
+
+        mix_t = torch.as_tensor(mix_f).unsqueeze(0)
+        enroll_t = torch.as_tensor(enroll_f).unsqueeze(0)
+
+        if not _FIRST_CALL_LOGGED:
+            _FIRST_CALL_LOGGED = True
+            logger.info(
+                f"🔎 TSE first-call shapes: mix_t={tuple(mix_t.shape)} "
+                f"enroll_t={tuple(enroll_t.shape)} fs={TSE_NATIVE_SR}"
+            )
+
+        try:
+            waves = model(mix_t, fs=TSE_NATIVE_SR, enroll_ref1=enroll_t)
+        except (TypeError, AssertionError) as e_first:
+            logger.warning(f"TSE call with enroll_ref1 failed ({e_first}); trying enroll_ref")
+            try:
+                waves = model(mix_t, fs=TSE_NATIVE_SR, enroll_ref=enroll_t)
+            except (TypeError, AssertionError) as e_second:
+                logger.error(f"TSE call with enroll_ref also failed ({e_second}).")
+                return pcm_int16
+        except Exception as e:
+            logger.error(f"TD-SpeakerBeam extraction failed: {e}")
+            return pcm_int16
+
+        try:
+            if isinstance(waves, (list, tuple)):
+                enhanced = waves[0]
+            else:
+                enhanced = waves
+            if hasattr(enhanced, "detach"):
+                enhanced = enhanced.detach().cpu().numpy()
+            enhanced = np.asarray(enhanced).squeeze()
+            if enhanced.ndim > 1:
+                enhanced = enhanced[0]
+        except Exception as e:
+            logger.error(f"Could not post-process TSE output: {e}")
+            return pcm_int16
+
+        if enhanced.dtype == np.int16:
+            result = enhanced
+        else:
+            result = np.clip(enhanced * 32768.0, -32768, 32767).astype(np.int16)
+
+        if self._sample_rate != TSE_NATIVE_SR:
+            result = self._resample(result, TSE_NATIVE_SR, self._sample_rate)
+
+        # VAD-based fallback — if output silent but mix had speech, return mix
+        mix_rms = float(np.sqrt(np.mean(pcm_int16.astype(np.float32) ** 2)))
+        out_rms = float(np.sqrt(np.mean(result.astype(np.float32) ** 2)))
+        if mix_rms > 100.0 and out_rms < 0.15 * mix_rms:
+            logger.warning(
+                f"TSE output too quiet ({out_rms:.1f} vs mix {mix_rms:.1f}) — "
+                f"returning mixture to avoid silencing caller"
+            )
+            return pcm_int16
+
+        return result

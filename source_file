@@ -1,1 +1,148 @@
 
+"""
+source_separator.py - SpeechBrain SepFormer source separation (v2.1)
+===================================================================
+"""
+import os
+import logging
+import threading
+import numpy as np
+import torch
+
+logger = logging.getLogger("speaker_lock_sdk.source_separator")
+
+SOURCE_SEPARATION_ENABLED = os.getenv("SOURCE_SEPARATION", "true").lower() == "true"
+SEPARATOR_MODEL           = os.getenv("SEPARATOR_MODEL", "speechbrain/sepformer-wsj02mix")
+SEPARATOR_NUM_SPEAKERS    = int(os.getenv("SEPARATOR_NUM_SPEAKERS", "2"))
+SEPARATOR_MIN_MS          = float(os.getenv("SEPARATOR_MIN_MS", "1500"))
+SEPARATOR_MAX_MS          = float(os.getenv("SEPARATOR_MAX_MS", "6000"))
+SEPARATOR_MATCH_MIN_SIM   = float(os.getenv("SEPARATOR_MATCH_MIN_SIM", "0.40"))
+SEPARATOR_NATIVE_SR       = 8000
+
+if not hasattr(torch.amp, "custom_fwd"):
+    try:
+        from torch.cuda.amp import custom_fwd as _legacy_custom_fwd
+        from torch.cuda.amp import custom_bwd as _legacy_custom_bwd
+
+        def _shim_custom_fwd(fwd=None, *, device_type=None, cast_inputs=None):
+            return _legacy_custom_fwd(fwd, cast_inputs=cast_inputs)
+
+        def _shim_custom_bwd(bwd=None, *, device_type=None):
+            return _legacy_custom_bwd(bwd)
+
+        torch.amp.custom_fwd = _shim_custom_fwd
+        torch.amp.custom_bwd = _shim_custom_bwd
+    except Exception as _shim_err:
+        logger.error(f"❌ torch.amp custom_fwd shim failed ({_shim_err}).")
+
+_MODEL = None
+_MODEL_LOADED = False
+_MODEL_FAILED = False
+_LOAD_LOCK = threading.Lock()
+
+
+def _load_separator():
+    global _MODEL, _MODEL_LOADED, _MODEL_FAILED
+    if _MODEL_LOADED or _MODEL_FAILED:
+        return _MODEL
+    with _LOAD_LOCK:
+        if _MODEL_LOADED or _MODEL_FAILED:
+            return _MODEL
+        try:
+            logger.info(f"🧠 Loading SepFormer separator ({SEPARATOR_MODEL})...")
+            from speechbrain.inference.separation import SepformerSeparation
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _MODEL = SepformerSeparation.from_hparams(
+                source=SEPARATOR_MODEL,
+                savedir="pretrained_models/sepformer",
+                run_opts={"device": device},
+            )
+            _MODEL.eval()
+            _MODEL_LOADED = True
+            logger.info(f"✅ SepFormer loaded on {device.upper()}")
+        except Exception as e:
+            _MODEL_FAILED = True
+            logger.error(f"❌ Failed to load SepFormer: {e}")
+        return _MODEL
+
+
+class SourceSeparator:
+    def __init__(self, sample_rate: int = 8000):
+        self._sample_rate = sample_rate
+
+    def _ensure_model(self):
+        return _load_separator()
+
+    def available(self) -> bool:
+        return SOURCE_SEPARATION_ENABLED and self._ensure_model() is not None
+
+    def _resample(self, pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+        if src_rate == dst_rate or len(pcm) == 0:
+            return pcm
+        n_out = int(len(pcm) * dst_rate / src_rate)
+        if n_out <= 0:
+            return pcm
+        idx = np.linspace(0, len(pcm) - 1, n_out)
+        return np.interp(idx, np.arange(len(pcm)), pcm).astype(np.int16)
+
+    def separate(self, pcm_int16: np.ndarray) -> list:
+        model = self._ensure_model()
+        if model is None or len(pcm_int16) == 0:
+            return [pcm_int16]
+
+        work = (self._resample(pcm_int16, self._sample_rate, SEPARATOR_NATIVE_SR)
+                if self._sample_rate != SEPARATOR_NATIVE_SR else pcm_int16)
+
+        min_s = int(SEPARATOR_MIN_MS * SEPARATOR_NATIVE_SR / 1000)
+        max_s = int(SEPARATOR_MAX_MS * SEPARATOR_NATIVE_SR / 1000)
+        if len(work) < min_s:
+            work = np.pad(work, (0, min_s - len(work)))
+        if len(work) > max_s:
+            work = work[-max_s:]
+
+        waveform = torch.from_numpy(work.astype(np.float32) / 32768.0).unsqueeze(0)
+        if torch.cuda.is_available():
+            waveform = waveform.cuda()
+
+        with torch.no_grad():
+            est = model.separate_batch(waveform)
+
+        streams = []
+        for i in range(est.shape[-1]):
+            s = est[0, :, i].detach().cpu().numpy()
+            s = np.clip(s * 32768.0, -32768, 32767).astype(np.int16)
+            if self._sample_rate != SEPARATOR_NATIVE_SR:
+                s = self._resample(s, SEPARATOR_NATIVE_SR, self._sample_rate)
+            streams.append(s)
+        return streams
+
+
+def pick_matching_stream(streams, profile, embed_fn, sample_rate: int = 8000):
+    if not streams or profile is None:
+        return None, 0.0
+
+    best_stream, best_sim = None, -1.0
+    for s in streams:
+        if len(s) < 1600:
+            continue
+        n = len(s)
+        windows = [s[i * n // 3:(i + 1) * n // 3] for i in range(3)]
+        sims = []
+        for w in windows:
+            if len(w) < 800:
+                continue
+            try:
+                emb = embed_fn(w, sample_rate)
+                if emb is None or not np.any(emb):
+                    continue
+                sims.append(float(np.dot(emb, profile)))
+            except Exception as e:
+                logger.debug(f"embed failed for stream: {e}")
+                continue
+        if not sims:
+            continue
+        avg = float(np.mean(sims))
+        if avg > best_sim:
+            best_sim, best_stream = avg, s
+    return best_stream, best_sim
